@@ -13,7 +13,6 @@
 #include <netinet/in.h>
 
 #define BUFSIZE 516
-#define DATA_HEADER 4
 #define MAX_TO 10
 
 #define RRQ 1
@@ -24,9 +23,15 @@
 
 #ifdef DEBUG
 #define D_PRINTF(...) printf(__VA_ARGS__)
+#define PORT 9877
 #else
 #define D_PRINTF(...)
+#define PORT 0
 #endif
+
+char BUF[BUFSIZE];
+unsigned short int * OPCODE_PTR = (unsigned short int *)BUF;
+socklen_t SOCKADDR_LEN = sizeof(struct sockaddr);
 
 /* TODO
  * check correct use of htons vs ntohs
@@ -40,8 +45,8 @@
  *      store old client info and compare
  * wrappers around repeated sections?
  *      send/recv?
- * pass in buf?
- * close() vs shutdown()
+ * close file before exiting
+ *      new error codes for tftp_sendto/recvfrom returns?
  */
 void sig_child(int signo) {
     int saved_errno = errno;
@@ -53,48 +58,93 @@ void sig_child(int signo) {
     errno = saved_errno;
 }
 
-void handle_error(int sockfd, struct sockaddr_in * clientaddr, char buf[BUFSIZE], socklen_t sockaddr_len, int err) {
-    int n;
-    unsigned short int * opcode_ptr;
+int tftp_sendto(int sockfd, int buf_len, struct sockaddr_in * clientaddr) {
+    ssize_t n;
 
-    opcode_ptr = (unsigned short int *)buf;
-    *opcode_ptr = htons(ERROR);
-    *(opcode_ptr + 1) = htons(err);
-    *(buf + 4) = 0;
-
-error_send:
-    n = sendto(sockfd, buf, BUFSIZE, 0, (struct sockaddr *)clientaddr, sockaddr_len);
+send:
+    n = sendto(sockfd, BUF, buf_len, 0, (struct sockaddr *)clientaddr, SOCKADDR_LEN);
     if (n < 0) {
-        if (errno == EINTR) goto error_send;
+        if (errno == EINTR) goto send;
         perror("sendto");
         exit(-1);
     }
+    return n;
+}
+
+int tftp_recvfrom(int sockfd, int seq_num, int expected, struct sockaddr_in * clientaddr) {
+    size_t timeouts;
+    ssize_t n;
+    struct sockaddr_in recvaddr;
+    unsigned short int opcode;
+
+    timeouts = 0;
+
+recv:
+    n = recvfrom(sockfd, BUF, BUFSIZE, 0, (struct sockaddr *)&recvaddr, &SOCKADDR_LEN);
+    /* TODO
+     * check TID with clientaddr
+     */
+    if (n < 0) {
+        if (errno == EINTR) goto recv;
+        else if (errno == EAGAIN) {
+            timeouts++;
+            if (timeouts == MAX_TO) {
+                fprintf(stderr, "Conenction timed out\n");
+                return -1;
+            }
+            goto recv;
+        }
+        perror("recvfrom");
+        exit(-1);
+    }
+
+    opcode = ntohs(*OPCODE_PTR);
+
+    if (opcode != expected) {
+        if (opcode == ERROR) {
+            fprintf(stderr, "Recieved error: %s\n", BUF + 4);
+            exit(-1);
+        }
+        return -1;
+    }
+
+    if (ntohs(*(OPCODE_PTR + 1)) != seq_num) goto recv;
+
+    return n;
+}
+
+void handle_error(int sockfd, struct sockaddr_in * clientaddr) {
+    unsigned short int * OPCODE_PTR;
+
+    OPCODE_PTR = (unsigned short int *)BUF;
+    *OPCODE_PTR = htons(ERROR);
+    *(OPCODE_PTR + 1) = htons(0);
+    *(BUF + 4) = 0;
+
+    tftp_sendto(sockfd, 5, clientaddr);
     close(sockfd);
     exit(-1);
 }
 
-void handle_read(int sockfd, struct sockaddr_in * clientaddr, char * buf, socklen_t sockaddr_len, FILE *fp) {
+void handle_read(int sockfd, struct sockaddr_in * clientaddr, FILE *fp) {
+    size_t seq_num;
     ssize_t n;
     ssize_t b_read;
-    int err;
-    unsigned short int seq_num, data_seq_num, opcode, timeouts;
-    unsigned short int * opcode_ptr;
     
     seq_num = 1;
-    timeouts = 0;
-    opcode_ptr = (unsigned short int *)buf;
 
     while (1) {
-        *(opcode_ptr) = htons(DATA);
-        *(opcode_ptr + 1) = htons(seq_num);
+        *(OPCODE_PTR) = htons(DATA);
+        *(OPCODE_PTR + 1) = htons(seq_num);
 
-        b_read = fread(buf + 4, 1, BUFSIZE - DATA_HEADER, fp);
+        b_read = fread(BUF + 4, 1, 512, fp);
         if (b_read < 0) {
             /* TODO
              * error codes
              * error packet???
              */
             perror("fread");
+            fclose(fp);
             exit(-1);
         } else if (b_read < 512) {
             /* last packet */
@@ -103,138 +153,65 @@ void handle_read(int sockfd, struct sockaddr_in * clientaddr, char * buf, sockle
              */
         }
 
-read_send:
-        n = sendto(sockfd, buf, b_read + 4, 0, (struct sockaddr *)clientaddr, sockaddr_len);
+        tftp_sendto(sockfd, b_read + 4, clientaddr);
+        n = tftp_recvfrom(sockfd, seq_num, ACK, clientaddr);
+
         if (n < 0) {
-            if (errno == EINTR) goto read_send;
-            perror("sendto");
-            exit(-1);
-        }
-
-read_recv:
-        n = recvfrom(sockfd, buf, BUFSIZE, 0, (struct sockaddr *) clientaddr, &sockaddr_len);
-        if (n < 0) {
-            if (errno == EINTR) goto read_recv;
-            else if (errno == EAGAIN) {
-                timeouts++;
-                if (timeouts == MAX_TO) {
-                    fprintf(stderr, "Conenction timed out\n");
-                    return;
-                }
-                goto read_recv;
-            }
-            perror("recvfrom");
-            exit(-1);
-        }
-
-        opcode = ntohs(*opcode_ptr);
-        data_seq_num = ntohs(*(opcode_ptr + 1));
-
-        if (opcode != ACK) {
-            if (opcode == ERROR) {
-                fprintf(stderr, "recieved error: %s\n", buf + 4);
-            }
-            err = 4;
             fclose(fp);
-            handle_error(sockfd, clientaddr, buf, sockaddr_len, err);
+            handle_error(sockfd, clientaddr);
         }
 
-        if (data_seq_num != seq_num) goto read_recv;
+        /* TODO
+         * need last ACK
+         */
 
         if (b_read < 512) return;
 
-        timeouts = 0;
         seq_num++;
     }
 }
 
-void handle_write(int sockfd, struct sockaddr_in * clientaddr, char * buf, socklen_t sockaddr_len, FILE *fp) {
-    ssize_t n;
+void handle_write(int sockfd, struct sockaddr_in * clientaddr, FILE *fp) {
+    size_t seq_num;
     ssize_t b_read;
-    int err;
-    bool ret;
-    unsigned short int seq_num, data_seq_num, opcode, timeouts;
-    unsigned short int * opcode_ptr;
 
-    ret = false;
     seq_num = 0;
-    timeouts = 0;
-    opcode_ptr = (unsigned short int *)buf;
 
     while (1) {
-        *opcode_ptr = htons(ACK);
-        *(opcode_ptr + 1) = htons(seq_num);
+        *OPCODE_PTR = htons(ACK);
+        *(OPCODE_PTR + 1) = htons(seq_num);
+        tftp_sendto(sockfd, 4, clientaddr);
 
-write_send:
-        n = sendto(sockfd, buf, 4, 0, (struct sockaddr *)clientaddr, sockaddr_len);
-        if (n < 0) {
-            if (errno == EINTR) goto write_send;
-            perror("sendto");
-            exit(-1);
-        }
-        if (ret) {
-            return;
-        }
         seq_num++;
 
-write_recv:
-        b_read = recvfrom(sockfd, buf, BUFSIZE, 0, (struct sockaddr *)clientaddr, &sockaddr_len);
+        b_read = tftp_recvfrom(sockfd, seq_num, DATA, clientaddr);
+
         if (b_read < 0) {
-            if (errno == EINTR) goto write_recv;
-            else if (errno == EAGAIN) {
-                timeouts++;
-                if (timeouts == MAX_TO) {
-                    fprintf(stderr, "Connection timed out\n");
-                    return;
-                }
-                goto write_recv;
-            }
-            perror("recvfrom");
-            exit(-1);
-        }
-
-        opcode = ntohs(*opcode_ptr);
-        data_seq_num = ntohs(*(opcode_ptr + 1));
-
-        if (opcode != DATA) {
-            /* TODO
-             * error code if other packet types?
-             */
-            if (opcode == ERROR) {
-                fprintf(stderr, "Recieved error: %s\n", buf + 4);
-                exit(-1);
-            }
-            err = 4;
             fclose(fp);
-            handle_error(sockfd, clientaddr, buf, sockaddr_len, err);
+            handle_error(sockfd, clientaddr);
         }
 
-        if (data_seq_num != seq_num) goto write_recv;
-        timeouts = 0;
-
-        fwrite(buf + 4, 1, b_read - DATA_HEADER, fp);
+        fwrite(BUF + 4, 1, b_read - 4, fp);
 
         if (b_read < 516) {
-            ret = true;
+            *OPCODE_PTR = htons(ACK);
+            *(OPCODE_PTR + 1) = htons(seq_num);
+            tftp_sendto(sockfd, 4, clientaddr);
+            return;
         }
     }
 }
 
 int main() {
-    int err;
+    int sockfd;
     char * mode;
     FILE * fp;
     ssize_t n;
-    char buf[BUFSIZE];
-    socklen_t sockaddr_len;
-    int sockfd;
     pid_t pid;
-    struct sigaction act;
     unsigned short int opcode;
-    unsigned short int * opcode_ptr;
+    struct sigaction act;
     struct sockaddr_in serveraddr, clientaddr;
     
-    err = 0;
     /* Set up interrupt handlers */
     act.sa_handler = sig_child;
     sigemptyset(&act.sa_mask);
@@ -242,17 +219,11 @@ int main() {
     sigaction(SIGCHLD, &act, NULL);
     
     /* Set up UDP socket */
-    sockaddr_len = sizeof(serveraddr);
-    
-    memset(&serveraddr, 0, sockaddr_len);
-    memset(&clientaddr, 0, sockaddr_len);
+    memset(&serveraddr, 0, SOCKADDR_LEN);
+    memset(&clientaddr, 0, SOCKADDR_LEN);
     
     serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);
-#ifdef DEBUG
-    serveraddr.sin_port = htons(9877);
-#else
-    serveraddr.sin_port = htons(0);
-#endif
+    serveraddr.sin_port = htons(PORT);
     serveraddr.sin_family = PF_INET;
     
     if ((sockfd = socket(PF_INET, SOCK_DGRAM, 0)) < 0) {
@@ -260,37 +231,34 @@ int main() {
         exit(-1);
     }
 
-    if (bind(sockfd, (struct sockaddr *)&serveraddr, sockaddr_len) < 0) {
+    if (bind(sockfd, (struct sockaddr *)&serveraddr, SOCKADDR_LEN) < 0) {
         perror("bind");
         exit(-1);
     }
     
     /* Get port and print it */
-    getsockname(sockfd, (struct sockaddr *)&serveraddr, &sockaddr_len);
+    getsockname(sockfd, (struct sockaddr *)&serveraddr, &SOCKADDR_LEN);
     
     printf("%d\n", ntohs(serveraddr.sin_port));
     
     /* Receive the first packet and deal w/ it accordingly */
     while(1) {
 intr_recv:
-        n = recvfrom(sockfd, buf, BUFSIZE, 0,
-                (struct sockaddr *)&clientaddr, &sockaddr_len);
+        n = recvfrom(sockfd, BUF, BUFSIZE, 0, (struct sockaddr *)&clientaddr, &SOCKADDR_LEN);
         if (n < 0) {
             if (errno == EINTR) goto intr_recv;
             perror("recvfrom");
             exit(-1);
         }
         /* check the opcode */
-        opcode_ptr = (unsigned short int *)buf;
-        opcode = ntohs(*opcode_ptr);
+        opcode = ntohs(*OPCODE_PTR);
         if (opcode != RRQ && opcode != WRQ) {
             /* Illegal TFTP Operation */
-            *opcode_ptr = htons(ERROR);
-            *(opcode_ptr + 1) = htons(4);
-            *(buf + 4) = 0;
+            *OPCODE_PTR = htons(ERROR);
+            *(OPCODE_PTR + 1) = htons(4);
+            *(BUF + 4) = 0;
 intr_send:
-            n = sendto(sockfd, buf, 5, 0,
-                       (struct sockaddr *)&clientaddr, sockaddr_len);
+            n = sendto(sockfd, BUF, 5, 0, (struct sockaddr *)&clientaddr, SOCKADDR_LEN);
             if (n < 0) {
                 if (errno == EINTR) goto intr_send;
                 perror("sendto");
@@ -313,7 +281,7 @@ intr_send:
     }
     if (pid) goto pre_ret;
 
-    memset(&serveraddr, 0, sockaddr_len);
+    memset(&serveraddr, 0, SOCKADDR_LEN);
 
     serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);
     serveraddr.sin_port = htons(0);
@@ -332,7 +300,7 @@ intr_send:
     }
     */
 
-    if (bind(sockfd, (struct sockaddr *)&serveraddr, sockaddr_len) < 0) {
+    if (bind(sockfd, (struct sockaddr *)&serveraddr, SOCKADDR_LEN) < 0) {
         perror("bind");
         exit(-1);
     }
@@ -347,18 +315,18 @@ intr_send:
     if (opcode == RRQ) mode = "r";
     else if (opcode == WRQ) mode = "w";
 
-    fp = fopen (buf + 2, mode);
+    fp = fopen (BUF + 2, mode);
     if (fp == NULL) {
         perror("file access");
-        err = 0;
-        handle_error(sockfd, &clientaddr, buf, sockaddr_len, err);
+        handle_error(sockfd, &clientaddr);
     }
 
-    if (opcode == RRQ) handle_read(sockfd, &clientaddr, buf, sockaddr_len, fp);
-    else if (opcode == WRQ) handle_write(sockfd, &clientaddr, buf, sockaddr_len, fp);
+    if (opcode == RRQ) handle_read(sockfd, &clientaddr, fp);
+    else if (opcode == WRQ) handle_write(sockfd, &clientaddr, fp);
     
-pre_ret:
     fclose(fp);
+
+pre_ret:
     close(sockfd);
     return 0;
 }
