@@ -1,0 +1,9 @@
+Benjamin Shaw
+Team of 1 woohoo
+
+As it is, the timeout system is not at all optimal. There is potential for an
+attacker to keep a port open when a connection has timed out by continuously
+sending packets from a bad TID. According to the RFC, this does not cause the
+server child to close the connection. The timeout does not increment in this
+case and has the potential for an attacker to send a packet a second and
+potentially crash the server by allowing keeping too many open ports.
