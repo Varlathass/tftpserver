@@ -7,3 +7,15 @@ sending packets from a bad TID. According to the RFC, this does not cause the
 server child to close the connection. The timeout does not increment in this
 case and has the potential for an attacker to send a packet a second and
 potentially crash the server by allowing keeping too many open ports.
+
+There is potential (though highly unlikely chance) for tftp_recvfrom to have
+issues. If a packet from a bad TID and a packet from the correct source arrive
+at the same time, recvfrom may return the contents of both packets in the
+buffer. This is however, highly unlikely to happen and as such is considered not
+to be a concern.
+
+During a WRQ, if the file is already present no error is thrown. Instead it is
+truncated 0 length and overwritten.
+
+File access permission errors and other file access errors are not fully
+implemented.

@@ -33,21 +33,12 @@ char BUF[BUFSIZE];
 unsigned short int * OPCODE_PTR = (unsigned short int *)BUF;
 socklen_t SOCKADDR_LEN = sizeof(struct sockaddr);
 
+void handle_error(int, struct sockaddr_in *, unsigned int);
 /* TODO
- * check correct use of htons vs ntohs
- * ask about timeout, reset when bad packet or bad TID recieved?
- *      if issue, implement different timeo scheme
- *      use alarm?
- * comments
- * cleanse input
- * rethink length of socket reads for different packets
- * check TID
- *      store old client info and compare
- * wrappers around repeated sections?
- *      send/recv?
- * close file before exiting
- *      new error codes for tftp_sendto/recvfrom returns?
+ * redo file opening and error code checks
+ * write error message in buffer for err = 0?
  */
+
 void sig_child(int signo) {
     int saved_errno = errno;
     pid_t pid;
@@ -66,7 +57,7 @@ send:
     if (n < 0) {
         if (errno == EINTR) goto send;
         perror("sendto");
-        exit(-1);
+        return -1;
     }
     return n;
 }
@@ -75,27 +66,32 @@ int tftp_recvfrom(int sockfd, int seq_num, int expected, struct sockaddr_in * cl
     size_t timeouts;
     ssize_t n;
     struct sockaddr_in recvaddr;
-    unsigned short int opcode;
+    unsigned short int opcode, tid;
 
     timeouts = 0;
+    tid = clientaddr->sin_port;
 
 recv:
     n = recvfrom(sockfd, BUF, BUFSIZE, 0, (struct sockaddr *)&recvaddr, &SOCKADDR_LEN);
-    /* TODO
-     * check TID with clientaddr
-     */
     if (n < 0) {
         if (errno == EINTR) goto recv;
         else if (errno == EAGAIN) {
             timeouts++;
-            if (timeouts == MAX_TO) {
+            if (timeouts >= MAX_TO) {
                 fprintf(stderr, "Conenction timed out\n");
                 return -1;
             }
             goto recv;
         }
         perror("recvfrom");
-        exit(-1);
+        handle_error(sockfd, clientaddr, 0);
+        return -1;
+    }
+
+    if (clientaddr->sin_port != tid) {
+        handle_error(sockfd, clientaddr, 5);
+        clientaddr->sin_port = tid;
+        goto recv;
     }
 
     opcode = ntohs(*OPCODE_PTR);
@@ -103,8 +99,9 @@ recv:
     if (opcode != expected) {
         if (opcode == ERROR) {
             fprintf(stderr, "Recieved error: %s\n", BUF + 4);
-            exit(-1);
+            return -1;
         }
+        handle_error(sockfd, clientaddr, 4);
         return -1;
     }
 
@@ -113,22 +110,15 @@ recv:
     return n;
 }
 
-void handle_error(int sockfd, struct sockaddr_in * clientaddr) {
-    unsigned short int * OPCODE_PTR;
-
-    OPCODE_PTR = (unsigned short int *)BUF;
+void handle_error(int sockfd, struct sockaddr_in * clientaddr, unsigned int err) {
     *OPCODE_PTR = htons(ERROR);
-    *(OPCODE_PTR + 1) = htons(0);
+    *(OPCODE_PTR + 1) = htons(err);
     *(BUF + 4) = 0;
-
     tftp_sendto(sockfd, 5, clientaddr);
-    close(sockfd);
-    exit(-1);
 }
 
 void handle_read(int sockfd, struct sockaddr_in * clientaddr, FILE *fp) {
     size_t seq_num;
-    ssize_t n;
     ssize_t b_read;
     
     seq_num = 1;
@@ -137,32 +127,20 @@ void handle_read(int sockfd, struct sockaddr_in * clientaddr, FILE *fp) {
         *(OPCODE_PTR) = htons(DATA);
         *(OPCODE_PTR + 1) = htons(seq_num);
 
+read:
         b_read = fread(BUF + 4, 1, 512, fp);
         if (b_read < 0) {
-            /* TODO
-             * error codes
-             * error packet???
-             */
+            if (errno == EINTR) goto read;
             perror("fread");
-            fclose(fp);
-            exit(-1);
-        } else if (b_read < 512) {
-            /* last packet */
-            /* TODO
-             * test 0 read bytes
-             */
+            handle_error(sockfd, clientaddr, 0);
+            return;
         }
 
-        tftp_sendto(sockfd, b_read + 4, clientaddr);
-        n = tftp_recvfrom(sockfd, seq_num, ACK, clientaddr);
-
-        if (n < 0) {
-            fclose(fp);
-            handle_error(sockfd, clientaddr);
-        }
+        if (tftp_sendto(sockfd, b_read + 4, clientaddr) < 0) return;
+        if (tftp_recvfrom(sockfd, seq_num, ACK, clientaddr) < 0) return;
 
         /* TODO
-         * need last ACK
+         * should check for last ACK
          */
 
         if (b_read < 512) return;
@@ -187,8 +165,7 @@ void handle_write(int sockfd, struct sockaddr_in * clientaddr, FILE *fp) {
         b_read = tftp_recvfrom(sockfd, seq_num, DATA, clientaddr);
 
         if (b_read < 0) {
-            fclose(fp);
-            handle_error(sockfd, clientaddr);
+            return;
         }
 
         fwrite(BUF + 4, 1, b_read - 4, fp);
@@ -291,14 +268,12 @@ intr_send:
         perror("socket");
         exit(-1);
     }
-/*
     struct timeval tv;
     tv.tv_sec = 1;
     tv.tv_usec = 0;
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,&tv,sizeof(tv)) < 0) {
         perror("Error");
     }
-    */
 
     if (bind(sockfd, (struct sockaddr *)&serveraddr, SOCKADDR_LEN) < 0) {
         perror("bind");
@@ -308,17 +283,24 @@ intr_send:
     /* TODO
      * buffer overflow?
      * implement error code checks
-     * man 2 open
      * access denied, file not found, file couldn't be created, file already created
      * prevent directory transversal
      */
     if (opcode == RRQ) mode = "r";
     else if (opcode == WRQ) mode = "w";
 
+open:
     fp = fopen (BUF + 2, mode);
     if (fp == NULL) {
+        //int err;
         perror("file access");
-        handle_error(sockfd, &clientaddr);
+        if (errno == EINTR) goto open;
+        /*
+        else if (errno == EACCES) err = 2;
+        else if (errno == ENOENT
+        */
+        handle_error(sockfd, &clientaddr, 0);
+        goto pre_ret;
     }
 
     if (opcode == RRQ) handle_read(sockfd, &clientaddr, fp);
