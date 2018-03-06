@@ -1,6 +1,6 @@
 
 CC := gcc
-CFLAGS := -Wall -g -D DEBUG
+CFLAGS := -Wall
 
 LINKER := gcc
 LFLAGS := -Wall -g
